@@ -1,0 +1,86 @@
+import torch
+import torch.nn as nn
+from sparseconvnet import SparseConv2d, denseToSparse, sparseToDense  # SparseConvNet
+from networks.transunet import Attention  # TransUNet-Attention
+
+
+# 1. Layer Norm + Sparse
+class LayerNormSparse(nn.Module):
+    def __init__(self, dim, spatial_size=16, drop=0.):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, eps=1e-6)  # TransUNet-LayerNorm
+        self.spatial_size = spatial_size
+
+        # SparseConv2d
+        self.sparse_conv = SparseConv2d(
+            in_channels=dim,
+            out_channels=dim,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            dilation=1,
+            bias=True
+        )
+        self.drop = nn.Dropout(drop)  # TransUNet-Dropout
+
+    def forward(self, x):
+        # [B, N, C] → [B, C, H, W] → 稀疏转换
+        B, N, C = x.shape
+        x = self.norm(x)  
+        x = x.permute(0, 2, 1).reshape(B, C, self.spatial_size, self.spatial_size)
+        x_sparse = denseToSparse(x)
+
+        x_sparse = self.sparse_conv(x_sparse)
+        x_sparse = self.drop(x_sparse)
+
+        # [B, C, H, W] → [B, N, C]
+        x = sparseToDense(x_sparse, self.spatial_size)
+        x = x.reshape(B, C, N).permute(0, 2, 1)
+        return x
+
+
+# 2. Decoder Block（LayerNorm-Sparse → LayerNorm-MHSA → LayerNorm-MLP）
+class MaskedCrossAttentionDecoderBlock_Plan2(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, dropout=0., attn_dropout=0.,
+                 spatial_size=16):
+        super().__init__()
+        # 1.Layer Norm + Sparse
+        self.norm1 = nn.LayerNorm(dim, eps=1e-6)
+        self.layer_norm_sparse = LayerNormSparse(dim, spatial_size, dropout)
+        self.dropout1 = nn.Dropout(dropout)
+
+        # 2.Layer Norm + MHSA
+        self.norm2 = nn.LayerNorm(dim, eps=1e-6)
+        self.mhsa = Attention(
+            dim=dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            attn_drop=attn_dropout,
+            proj_drop=dropout
+        )
+        self.dropout2 = nn.Dropout(dropout)
+
+        # 3.Layer Norm + MLP
+        self.norm3 = nn.LayerNorm(dim, eps=1e-6)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, features, query, mask=None):
+        # 1.Layer Norm + Sparse
+        query = query + self.dropout1(self.layer_norm_sparse(self.norm1(query)))
+
+        # 2.Layer Norm + MHSA
+        cross_attn_output = self.mhsa(self.norm2(query), mask=mask, encoder_features=features)
+        query = query + self.dropout2(cross_attn_output)
+
+        # 3.Layer Norm + MLP
+        query = query + self.mlp(self.norm3(query))
+
+        return query
